@@ -48,19 +48,42 @@ def ensure_model():
 def capture_frames_windows(device_name):
     container = None
     try:
+        print(f"Tentando conectar com o nome: video={device_name} ...")
         container = av.open(
             f'video={device_name}', 
             format='dshow', 
             options={'framerate': '30', 'video_size': '640x480'}
         )
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO" 
-        
-        for frame in container.decode(stream):
-            yield frame.to_ndarray(format='bgr24')
+    except Exception as e_name:
+        print(f"Falha ao abrir por nome/resolução. Motivo: {e_name}")
+        print("Iniciando plano de contingência (Fallback automático)...")
+        try:
+            container = av.open(f'video={device_name}', format='dshow')
+            print("✅ Conectado via nome sem forçar resolução. Faremos o resize em software.")
+        except Exception:
+            try:
+                print("Tentando conectar via índice primário da máquina...")
+                container = av.open(format='dshow', file='video=video0') # Sintaxe genérica de fallback
+            except Exception as e_final:
+                print(f"Erro fatal: Câmera inacessível. O dispositivo pode estar em uso por outro app. Erro: {e_final}")
+                print("Dica: Verifique se o nome exato no Gerenciador de Dispositivos bate com o digitado.")
+                exit(1)
+
+    try:
+        if container is not None:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO" 
+            print("✅ Stream de vídeo iniciado!")
             
-    except Exception as e:
-        print(f"Erro fatal na captura: {e}")
+            for frame in container.decode(stream):
+                img_bgr = frame.to_ndarray(format='bgr24')
+                if img_bgr.shape[1] > 640:
+                    img_bgr = cv2.resize(img_bgr, (640, int(640 * (img_bgr.shape[0] / img_bgr.shape[1]))))
+                
+                yield img_bgr
+                
+    except Exception as stream_error:
+        print(f"Erro ao decodificar os frames: {stream_error}")
         exit(1)
     finally:
         if container:

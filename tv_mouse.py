@@ -1,4 +1,3 @@
-import av
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -11,16 +10,59 @@ import os
 import time
 import ctypes
 import platform
+import threading
 from pynput.mouse import Button, Controller
 
-parser = argparse.ArgumentParser(description="TV Mouse Otimizado (PyAV + Tasks API)")
-parser.add_argument('--camera', type=str, required=True, help='Nome EXATO da câmera')
-parser.add_argument('--kando', type=float, default=3.0, help='Sensibilidade do movimento')
+parser = argparse.ArgumentParser(description="TV Mouse Otimizado (Threaded OpenCV + Tasks API)")
+parser.add_argument('--camera', type=int, default=0, help='ID numérico da câmera (geralmente 0 ou 1)')
+parser.add_argument('--kando', type=float, default=30.0, help='Sensibilidade do movimento')
 parser.add_argument('--headless', action='store_true', help='Desativa a janela de vídeo')
 args = parser.parse_args()
 
 mouse = Controller()
 pf = platform.system()
+
+class ThreadedCamera:
+    def __init__(self, src=0, width=640, height=480):
+        print(f"Iniciando câmera {src} via MSMF...")
+        self.cap = cv2.VideoCapture(src, cv2.CAP_MSMF)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        
+        if not self.cap.isOpened():
+            print(f"Erro fatal: Não foi possível abrir a câmera no índice {src}.")
+            print("Dica: Tente rodar com '--camera 1' se tiver mais de uma webcam conectada.")
+            exit(1)
+            
+        self.grabbed, self.frame = self.cap.read()
+        self.started = False
+        self.read_lock = threading.Lock()
+
+    def start(self):
+        if self.started: return None
+        self.started = True
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.daemon = True
+        self.thread.start()
+        return self
+
+    def update(self):
+        while self.started:
+            grabbed, frame = self.cap.read()
+            with self.read_lock:
+                self.grabbed = grabbed
+                self.frame = frame
+
+    def read(self):
+        with self.read_lock:
+            if not self.grabbed: return False, None
+            return True, self.frame.copy()
+
+    def stop(self):
+        self.started = False
+        self.thread.join()
+        self.cap.release()
 
 def get_virtual_screen():
     if pf == 'Windows':
@@ -43,51 +85,7 @@ def ensure_model():
     if not os.path.exists(MODEL_PATH):
         print(f'Baixando modelo mediapipe em {MODEL_PATH} ...')
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print('Download concluído.')
-
-def capture_frames_windows(device_name):
-    container = None
-    try:
-        print(f"Tentando conectar com o nome: video={device_name} ...")
-        container = av.open(
-            f'video={device_name}', 
-            format='dshow', 
-            options={'framerate': '30', 'video_size': '640x480'}
-        )
-    except Exception as e_name:
-        print(f"Falha ao abrir por nome/resolução. Motivo: {e_name}")
-        print("Iniciando plano de contingência (Fallback automático)...")
-        try:
-            container = av.open(f'video={device_name}', format='dshow')
-            print("✅ Conectado via nome sem forçar resolução. Faremos o resize em software.")
-        except Exception:
-            try:
-                print("Tentando conectar via índice primário da máquina...")
-                container = av.open(format='dshow', file='video=video0') # Sintaxe genérica de fallback
-            except Exception as e_final:
-                print(f"Erro fatal: Câmera inacessível. O dispositivo pode estar em uso por outro app. Erro: {e_final}")
-                print("Dica: Verifique se o nome exato no Gerenciador de Dispositivos bate com o digitado.")
-                exit(1)
-
-    try:
-        if container is not None:
-            stream = container.streams.video[0]
-            stream.thread_type = "AUTO" 
-            print("✅ Stream de vídeo iniciado!")
-            
-            for frame in container.decode(stream):
-                img_bgr = frame.to_ndarray(format='bgr24')
-                if img_bgr.shape[1] > 640:
-                    img_bgr = cv2.resize(img_bgr, (640, int(640 * (img_bgr.shape[0] / img_bgr.shape[1]))))
-                
-                yield img_bgr
-                
-    except Exception as stream_error:
-        print(f"Erro ao decodificar os frames: {stream_error}")
-        exit(1)
-    finally:
-        if container:
-            container.close()
+        print('✅ Download concluído.')
 
 def calculate_distance(l1, l2):
     return np.linalg.norm(np.array([l1.x, l1.y]) - np.array([l2.x, l2.y]))
@@ -117,122 +115,136 @@ def main():
     LiTx, LiTy = [], []
     nowUgo = 1
     start, c_start = float('inf'), float('inf')
-    ran = 3
+    ran = 3 
 
-    print(f"Iniciando controle rápido. Pressione Ctrl+C no terminal para encerrar.")
+    print(f"🚀 Iniciando controle rápido. Pressione Ctrl+C no terminal para encerrar.")
+    
+    cam = ThreadedCamera(src=args.camera).start()
 
-    for image in capture_frames_windows(args.camera):
-        p_s = time.perf_counter()
-        
-        image = cv2.flip(image, 1)
-        image_height, image_width, _ = image.shape
-
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp_ms = int(p_s * 1000)
-        
-        result = detector.detect_for_video(mp_image, timestamp_ms)
-
-        if result.hand_landmarks:
-            lm = result.hand_landmarks[0]
+    try:
+        while True:
+            p_s = time.perf_counter()
             
-            absKij = calculate_distance(lm[0], lm[1])
-            absUgo = calculate_distance(lm[8], lm[12]) / absKij
-            absCli = calculate_distance(lm[4], lm[6]) / absKij
-
-            if i == 0:
-                preX, preY = lm[8].x, lm[8].y
-                for _ in range(ran):
-                    LiTx.append(lm[8].x)
-                    LiTy.append(lm[8].y)
-                i += 1
-
-            LiTx.append(lm[8].x)
-            LiTy.append(lm[8].y)
-            if len(LiTx) > ran:
-                LiTx.pop(0)
-                LiTy.pop(0)
-
-            posx, posy = mouse.position
-            nowX = sum(LiTx) / ran
-            nowY = sum(LiTy) / ran
+            success, image = cam.read()
+            if not success or image is None:
+                time.sleep(0.01)
+                continue
             
-            dx = args.kando * (nowX - preX) * image_width
-            dy = args.kando * (nowY - preY) * image_height
-            dx += 0.5
-            dy += 0.5
+            image = cv2.flip(image, 1)
+            image_height, image_width, _ = image.shape
+
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int(p_s * 1000)
             
-            preX, preY = nowX, nowY
+            result = detector.detect_for_video(mp_image, timestamp_ms)
 
-            if posx + dx < virt_x: dx = virt_x - posx
-            elif posx + dx > screenRes[0]: dx = screenRes[0] - posx
-            if posy + dy < virt_y: dy = virt_y - posy
-            elif posy + dy > screenRes[1]: dy = screenRes[1] - posy
+            if result.hand_landmarks:
+                lm = result.hand_landmarks[0] 
+                
+                absKij = calculate_distance(lm[0], lm[1]) 
+                absUgo = calculate_distance(lm[8], lm[12]) / (absKij + 1e-6) 
+                absCli = calculate_distance(lm[4], lm[6]) / (absKij + 1e-6)  
 
-            if absCli < dis:
-                nowCli = 1
-                draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 20, (0, 250, 250))
-            else:
-                nowCli = 0
+                if i == 0:
+                    preX, preY = lm[8].x, lm[8].y
+                    for _ in range(ran):
+                        LiTx.append(lm[8].x)
+                        LiTy.append(lm[8].y)
+                    i += 1
 
-            if np.abs(dx) > 5 and np.abs(dy) > 5:
-                k = 0
+                LiTx.append(lm[8].x)
+                LiTy.append(lm[8].y)
+                if len(LiTx) > ran:
+                    LiTx.pop(0)
+                    LiTy.pop(0)
 
-            if nowCli == 1 and np.abs(dx) < 5 and np.abs(dy) < 5:
-                if k == 0:
-                    start = time.perf_counter()
-                    k += 1
-                if time.perf_counter() - start > 1.5:
-                    norCli = 1
-                    draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 20, (0, 0, 250))
-            else:
-                norCli = 0
+                posx, posy = mouse.position
+                nowX = sum(LiTx) / ran
+                nowY = sum(LiTy) / ran
+                
+                dx = args.kando * (nowX - preX) * image_width
+                dy = args.kando * (nowY - preY) * image_height
+                dx += 0.5
+                dy += 0.5
+                
+                preX, preY = nowX, nowY
 
-            if absUgo >= dis and nowUgo == 1:
-                mouse.move(dx, dy)
-                draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 8, (250, 0, 0))
+                if posx + dx < virt_x: dx = virt_x - posx
+                elif posx + dx > screenRes[0]: dx = screenRes[0] - posx
+                if posy + dy < virt_y: dy = virt_y - posy
+                elif posy + dy > screenRes[1]: dy = screenRes[1] - posy
 
-            if nowCli == 1 and nowCli != preCli:
-                if h == 1: h = 0
-                elif h == 0: mouse.press(Button.left)
+                if absCli < dis:
+                    nowCli = 1
+                    draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 20, (0, 250, 250))
+                else:
+                    nowCli = 0
 
-            if nowCli == 0 and nowCli != preCli:
-                mouse.release(Button.left)
-                k = 0
-                if douCli == 0:
-                    c_start = time.perf_counter()
-                    douCli += 1
-                if 10 * (time.perf_counter() - c_start) > 5 and douCli == 1:
-                    mouse.click(Button.left, 2)
-                    douCli = 0
+                if np.abs(dx) > 5 and np.abs(dy) > 5:
+                    k = 0
 
-            if norCli == 1 and norCli != prrCli:
-                mouse.press(Button.right)
-                mouse.release(Button.right)
-                h = 1
+                if nowCli == 1 and np.abs(dx) < 5 and np.abs(dy) < 5:
+                    if k == 0:
+                        start = time.perf_counter()
+                        k += 1
+                    if time.perf_counter() - start > 1.5:
+                        norCli = 1
+                        draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 20, (0, 0, 250))
+                else:
+                    norCli = 0
 
-            if lm[8].y - lm[5].y > -0.06:
-                mouse.scroll(0, -dy / 50)
-                draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 20, (0, 0, 0))
-                nowUgo = 0
-            else:
-                nowUgo = 1
+                if absUgo >= dis and nowUgo == 1:
+                    try:
+                        mouse.move(dx, dy)
+                    except: pass
+                    draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 8, (250, 0, 0))
 
-            preCli = nowCli
-            prrCli = norCli
+                if nowCli == 1 and nowCli != preCli:
+                    if h == 1: h = 0
+                    elif h == 0: mouse.press(Button.left)
 
-        if not args.headless:
-            p_e = time.perf_counter()
-            elapsed = p_e - p_s
-            fps = str(int(1 / elapsed)) if elapsed > 0 else '?'
-            cv2.putText(image, "FPS:" + fps, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-            
-            cv2.imshow("TV Mouse Otimizado", image)
-            if cv2.waitKey(1) & 0xFF == 27: 
-                break
+                if nowCli == 0 and nowCli != preCli:
+                    mouse.release(Button.left)
+                    k = 0
+                    if douCli == 0:
+                        c_start = time.perf_counter()
+                        douCli += 1
+                    if 10 * (time.perf_counter() - c_start) > 5 and douCli == 1:
+                        mouse.click(Button.left, 2)
+                        douCli = 0
 
-    cv2.destroyAllWindows()
-    detector.close()
+                if norCli == 1 and norCli != prrCli:
+                    mouse.press(Button.right)
+                    mouse.release(Button.right)
+                    h = 1
+
+                if lm[8].y - lm[5].y > -0.06:
+                    mouse.scroll(0, -dy / 50)
+                    draw_circle(image, lm[8].x * image_width, lm[8].y * image_height, 20, (0, 0, 0))
+                    nowUgo = 0
+                else:
+                    nowUgo = 1
+
+                preCli = nowCli
+                prrCli = norCli
+
+            if not args.headless:
+                p_e = time.perf_counter()
+                elapsed = p_e - p_s
+                fps = str(int(1 / elapsed)) if elapsed > 0 else '?'
+                cv2.putText(image, "FPS:" + fps, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+                
+                cv2.imshow("TV Mouse Otimizado", image)
+                if cv2.waitKey(1) & 0xFF == 27: 
+                    break
+
+    except KeyboardInterrupt:
+        print("\nEncerrando...")
+    finally:
+        cam.stop()
+        cv2.destroyAllWindows()
+        detector.close()
 
 if __name__ == "__main__":
     main()

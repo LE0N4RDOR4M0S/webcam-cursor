@@ -1,7 +1,9 @@
 mediapipe
 numpy
-opencv-python
+opencv-pythonmacbook
 pynput
 pyinstaller
 setuptools
 av
+imageio
+imageio-ffmpeg
